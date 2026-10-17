@@ -48,22 +48,56 @@ enum AppleSRPBuffer {
         return wrapped(fields)
     }
 
+    /// Type 36 step 1: `s(authid) s(userid) s(sid) o(client nonce)`.
+    static func securityType36Request(username: String, clientNonce: Data) throws -> Data {
+        var fields = Data()
+        try appendUTF8(username, to: &fields)
+        try appendUTF8("", to: &fields)
+        try appendUTF8("", to: &fields)
+        try appendOpaque(clientNonce, to: &fields)
+        return wrapped(fields)
+    }
+
     static func parseServerChallenge(_ data: Data) throws -> AppleSRPServerChallenge {
         var reader = Reader(data)
         let stepCode = try reader.readUInt32()
-        let section = try reader.readSection()
-        var sectionReader = Reader(section)
-        let step = try sectionReader.readUInt8()
-        let prime = try sectionReader.readMPI()
-        let generator = try sectionReader.readMPI()
-        let salt = try sectionReader.readOpaque()
-        let serverPublicKey = try sectionReader.readMPI()
-        let iterations = try sectionReader.readUInt64()
-        let options = try sectionReader.readUTF8()
-        try sectionReader.requireFullyRead()
+        var sectionReader = Reader(try reader.readSection())
+        return try readChallengeFields(&sectionReader, stepCode: stepCode)
+    }
+
+    /// Type 36 challenge: a length-wrapped buffer with no step code or section.
+    static func parseSecurityType36Challenge(_ data: Data) throws -> AppleSRPServerChallenge {
+        var reader = Reader(try unwrapped(data))
+        return try readChallengeFields(&reader, stepCode: 0)
+    }
+
+    static func parseServerConfirmation(_ data: Data) throws -> AppleSRPServerConfirmation {
+        var reader = Reader(data)
+        let step = try reader.readUInt32()
+        var sectionReader = Reader(try reader.readSection())
+        return try readConfirmationFields(&sectionReader, step: step)
+    }
+
+    static func parseSecurityType36Confirmation(_ data: Data) throws -> AppleSRPServerConfirmation {
+        var reader = Reader(try unwrapped(data))
+        return try readConfirmationFields(&reader, step: 0)
+    }
+
+    private static func readChallengeFields(
+        _ reader: inout Reader,
+        stepCode: UInt32
+    ) throws -> AppleSRPServerChallenge {
+        let step = try reader.readUInt8()
+        let prime = try reader.readMPI()
+        let generator = try reader.readMPI()
+        let salt = try reader.readOpaque()
+        let serverPublicKey = try reader.readMPI()
+        let iterations = try reader.readUInt64()
+        let options = try reader.readUTF8()
+        try reader.requireFullyRead()
 
         return AppleSRPServerChallenge(
-            step: step == 0 ? UInt8(stepCode) : step,
+            step: step == 0 ? UInt8(truncatingIfNeeded: stepCode) : step,
             prime: prime,
             generator: generator,
             serverPublicKey: serverPublicKey,
@@ -73,16 +107,15 @@ enum AppleSRPBuffer {
         )
     }
 
-    static func parseServerConfirmation(_ data: Data) throws -> AppleSRPServerConfirmation {
-        var reader = Reader(data)
-        let step = try reader.readUInt32()
-        let section = try reader.readSection()
-        var sectionReader = Reader(section)
-        let serverProof = try sectionReader.readOpaque()
-        let serverIV = try sectionReader.readOpaque()
-        let options = try sectionReader.readUTF8()
-        let maxBufferSize = try sectionReader.readUInt32()
-        try sectionReader.requireFullyRead()
+    private static func readConfirmationFields(
+        _ reader: inout Reader,
+        step: UInt32
+    ) throws -> AppleSRPServerConfirmation {
+        let serverProof = try reader.readOpaque()
+        let serverIV = try reader.readOpaque()
+        let options = try reader.readUTF8()
+        let maxBufferSize = try reader.readUInt32()
+        try reader.requireFullyRead()
         return AppleSRPServerConfirmation(
             step: step,
             serverProof: serverProof,
@@ -90,6 +123,16 @@ enum AppleSRPBuffer {
             options: options,
             maxBufferSize: maxBufferSize
         )
+    }
+
+    private static func unwrapped(_ buffer: Data) throws -> Data {
+        var reader = Reader(buffer)
+        let innerLength = Int(try reader.readUInt32())
+        guard innerLength == buffer.count - 4 else {
+            throw VNCProtocolError.authenticationFailed(
+                "Apple SRP buffer length mismatch: inner=\(innerLength), actual=\(buffer.count - 4)")
+        }
+        return Data(buffer.suffix(innerLength))
     }
 
     static func section(_ srpBuffer: Data) throws -> Data {

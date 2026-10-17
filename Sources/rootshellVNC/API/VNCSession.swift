@@ -1899,7 +1899,9 @@ public final class VNCSession {
             negotiatedContentEncryption = handshake.contentEncryption
         }
         serverCapabilities = handshake.appleServerCapabilities
-        let usesAppleModifiers = handshake.negotiatedVersion?.isApple == true
+        let usesAppleModifiers = configuration.remoteSystem.usesAppleModifiers(
+            isAppleProtocol: handshake.negotiatedVersion?.isApple == true,
+            offeredSecurityTypes: handshake.offeredSecurityTypes)
         if serverUsesAppleModifierConvention != usesAppleModifiers {
             serverUsesAppleModifierConvention = usesAppleModifiers
         }

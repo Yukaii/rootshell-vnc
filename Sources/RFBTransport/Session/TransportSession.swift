@@ -456,6 +456,7 @@ public actor TransportSession {
     /// follows that subscription with one explicit full-frame request.
     private var awaitingAppleDCTBootstrap: Bool
     private var appleDCTInitialUncoveredRegions: [AppleDCTCoverageRegion] = []
+    private var receivedAppleDCTRecord = false
     private var pendingAppleDCTAutoUpdateActivation = false
     private var pendingAppleDCTInitialFullFrameRequest = false
     private var pendingAppleClassicAutoUpdateActivation = false
@@ -534,6 +535,9 @@ public actor TransportSession {
     private var hasEncryptedAppleMediaControl: Bool {
         appleMediaComCryptionChannel != nil || appleEncryptedControlChannel != nil
     }
+    /// Media began at encoding-1010 message 1 with no 1103 offer, so the
+    /// control stream stays plaintext even when auth produced a session key.
+    private var appleMediaEnteredThroughMessageOne = false
     private var pendingAppleMediaRTPStream: PendingAppleMediaRTPStream?
     private var confirmedAppleMediaRTPStream: ConfirmedAppleMediaRTPStream?
     private var appleMediaSRTPKeys: AppleMediaSRTPKeys?
@@ -1597,8 +1601,8 @@ public actor TransportSession {
             // Type 33: MacAuthenticator reads its own auth result internally.
             // The server also sends a second VNC SecurityResult afterward.
             try await readSecurityResult(canReadReason: false)
-        } else if selectedType == .apple30 {
-            // Type 30 DH: server sends a 4-byte result after the DH exchange
+        } else if selectedType == .apple30 || selectedType == .appleSRP {
+            // Types 30 and 36 send a 4-byte result with no reason string.
             try await readSecurityResult(canReadReason: false)
         } else {
             let negotiatedVersion = stateMachine.negotiatedVersion ?? .v3_8
@@ -1759,6 +1763,11 @@ public actor TransportSession {
             )
         case .srp:
             authenticator = SRPAuthenticator(
+                username: username ?? "user",
+                password: password
+            )
+        case .appleSRP:
+            authenticator = AppleSRPAuthenticator(
                 username: username ?? "user",
                 password: password
             )
@@ -3307,12 +3316,43 @@ public actor TransportSession {
             maxY: Int(fbHeight))]
     }
 
+    private func portableRectsCoverFramebuffer(_ rectsWithData: [(FramebufferRect, Data)]) -> Bool {
+        guard fbWidth > 0, fbHeight > 0 else { return false }
+        var uncovered = [AppleDCTCoverageRegion(
+            minX: 0, minY: 0, maxX: Int(fbWidth), maxY: Int(fbHeight))]
+        for (rect, _) in rectsWithData {
+            switch rect.encoding {
+            case .raw, .zlib, .zrle, .tight:
+                let covered = AppleDCTCoverageRegion(
+                    minX: Int(rect.x),
+                    minY: Int(rect.y),
+                    maxX: Int(rect.x) + Int(rect.width),
+                    maxY: Int(rect.y) + Int(rect.height))
+                uncovered = uncovered.flatMap { $0.subtracting(covered) }
+            default:
+                continue
+            }
+        }
+        return uncovered.isEmpty
+    }
+
     private func recordAppleDCTBootstrapCoverage(
         from rectsWithData: [(FramebufferRect, Data)]
     ) {
         guard appleDCTRequested,
               stateMachine.negotiatedVersion?.isApple == true,
               awaitingAppleDCTBootstrap else { return }
+        if rectsWithData.contains(where: { $0.0.encoding == .appleMultiVariantScreenshare }) {
+            receivedAppleDCTRecord = true
+        }
+        // Apple-protocol servers without DCT (wayshare) answer with portable
+        // encodings only; waiting would keep every request non-incremental.
+        if !receivedAppleDCTRecord, portableRectsCoverFramebuffer(rectsWithData) {
+            awaitingAppleDCTBootstrap = false
+            appleDCTInitialUncoveredRegions = []
+            log.info("Server sent a full portable frame; not waiting for Apple DCT")
+            return
+        }
         if appleDCTInitialUncoveredRegions.isEmpty {
             resetAppleDCTBootstrapCoverage()
         }
@@ -3715,7 +3755,8 @@ public actor TransportSession {
         }
 
         if appleEncryptedControlChannel == nil,
-           stateMachine.selectedSecurityType != .vncAuthentication {
+           stateMachine.selectedSecurityType != .vncAuthentication,
+           !appleMediaEnteredThroughMessageOne {
             try ensureAppleEncryptedControlChannel()
         }
 
@@ -5119,6 +5160,10 @@ public actor TransportSession {
            (1...4).contains(override) {
             return Int(override)
         }
+        // wayshare encodes exactly four strips and drops a one-tile offer.
+        if SecurityType.offersAppleSRPWithoutMacTypes(stateMachine.offeredSecurityTypes) {
+            return 4
+        }
         if pixelWidth > 0, pixelHeight > 0,
            pixelWidth <= Int.max / pixelHeight {
             let selectedDisplayLumaSamples = pixelWidth * pixelHeight
@@ -5170,8 +5215,9 @@ public actor TransportSession {
         guard let message = findAppleAVCMediaMessage(in: payload) else { return false }
         guard message.messageType == 1 else { return false }
 
-        let isPasswordOnlyBootstrap = !acceptedAppleMediaStream
-            && stateMachine.selectedSecurityType == .vncAuthentication
+        // No 1103 offer preceded this: password-only Macs and servers that
+        // skip the 1103 exchange (wayshare) enter High Performance here.
+        let entersThroughMessageOne = !acceptedAppleMediaStream
 
         guard let transition = appleMediaGenerationTracker.beginMessageOne() else {
             log.warning("Ignoring duplicate AVC media message 1 while its answer is pending")
@@ -5179,13 +5225,14 @@ public actor TransportSession {
         }
         beginAppleMediaGeneration(transition)
 
-        // VNC Authentication (type 2) does not have the earlier encrypted
-        // RFBMediaStreamOffer/Answer exchange. Its encoding-1010 message 1 is
-        // the point at which the native viewer enters High Performance mode.
+        // Without the earlier encrypted RFBMediaStreamOffer/Answer exchange,
+        // encoding-1010 message 1 is the point at which the native viewer
+        // enters High Performance mode.
         // Keep the ordinary RFB stream in that mode while the AVC messages and
         // UDP media negotiation continue in plaintext.
         if !acceptedAppleMediaStream {
             acceptedAppleMediaStream = true
+            appleMediaEnteredThroughMessageOne = true
             emittedAppleMediaControlDiagnostics = 0
             appleMediaServerPacketID = 0
             appleMediaClientPacketID = 0
@@ -5201,14 +5248,14 @@ public actor TransportSession {
         log.debug("Server AVC media type-1 offered UDP ports \(ports); opening symmetric sockets")
         try await startAppleMediaStreamUDPIfNeeded(bindings: bindings)
 
-        if isPasswordOnlyBootstrap {
+        if entersThroughMessageOne {
             // Keyed Apple authentication publishes an earlier encoding-1103
             // RFBMediaStreamOffer, which is what creates VNCSession's decoder
-            // and installs its direct RTP sink. Password-only authentication
-            // enters the same media protocol at encoding 1010 message 1 and
-            // never sends 1103. Publish the equivalent semantic event here;
-            // without it transport successfully receives/decrypts RTP while
-            // the UI remains at "Waiting for first screen update" forever.
+            // and installs its direct RTP sink. This path enters the same media
+            // protocol at encoding 1010 message 1 and never sees 1103. Publish
+            // the equivalent semantic event here; without it transport
+            // successfully receives/decrypts RTP while the UI remains at
+            // "Waiting for first screen update" forever.
             let audioPort = ports.first
             let videoPort = ports.count > 1 ? ports[1] : ports.first
             let offer = AppleMediaStreamOffer(

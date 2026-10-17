@@ -111,6 +111,94 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
+    /// A server that skips the 1103 offer (wayshare) starts High Performance
+    /// at encoding-1010 message 1 after Apple SRP. The decoder must still get
+    /// an offer, and the session key must not switch the control stream to
+    /// encrypted records the server never agreed to.
+    func testAppleSRPHighPerformanceWithoutOfferStaysPlaintext() async throws {
+        let encodings: [Encoding] = [
+            .appleH264, .mediaStreamOffer, .serverDisplayInfo, .raw,
+        ]
+        let srp = try TestSRPServer(password: "secret", iterations: 1000)
+        var serverBytes = ProtocolVersion.apple.wireBytes()
+        serverBytes.append(contentsOf: [1, SecurityType.appleSRP.rawValue])
+        let fixture = try LoopbackRFBFixture(serverBytes: serverBytes)
+        defer { fixture.close() }
+        let session = TransportSession(
+            host: "127.0.0.1",
+            port: fixture.port,
+            password: "secret",
+            username: "kit",
+            preferredEncodings: encodings)
+        let connectTask = Task { try await session.connect() }
+
+        let handshakePrefix = ProtocolVersion.apple.wireBytes().count + 1
+        let stepOneLength = 8 + (2 + 3) + 2 + 2 + (1 + 16)
+        let stepOneBytes = await fixture.waitForClientBytes(atLeast: handshakePrefix + stepOneLength)
+        let stepOne = try XCTUnwrap(stepOneBytes)
+        XCTAssertEqual(stepOne[handshakePrefix - 1], SecurityType.appleSRP.rawValue)
+        try fixture.sendServerBytes(srp.challengeMessage)
+
+        let stepThreeLength = 8 + (2 + 256) + (1 + 64)
+            + (2 + AppleSRPAuthenticator.clientOptions.utf8.count) + (1 + 16)
+        let afterStepThree = handshakePrefix + stepOneLength + stepThreeLength
+        let stepThreeBytes = await fixture.waitForClientBytes(atLeast: afterStepThree)
+        let stepThree = try XCTUnwrap(stepThreeBytes)
+        var proof = SRPWireFields(unwrapping: Data(stepThree.dropFirst(handshakePrefix + stepOneLength)))
+        let verified = try XCTUnwrap(srp.verify(a: proof.mpi(), m1: proof.opaque()))
+        var reply = TestSRPServer.confirmationMessage(m2: verified.m2)
+        reply.append(contentsOf: [0, 0, 0, 0])
+        reply.append(Self.appleServerInitMessage(width: 1280, height: 800, name: "wayshare"))
+        try fixture.sendServerBytes(reply)
+        try await connectTask.value
+
+        let mediaRequest = ClientMessage.appleMediaStreamRequest.serialize()
+        let sentRequest = await Self.waitUntil {
+            guard let sent = await fixture.waitForClientBytes(atLeast: afterStepThree) else {
+                return false
+            }
+            return sent.range(of: mediaRequest) != nil
+        }
+        XCTAssertTrue(sentRequest)
+        let beforeMessageOneBytes = await fixture.waitForClientBytes(atLeast: afterStepThree)
+        let beforeMessageOne = try XCTUnwrap(beforeMessageOneBytes).count
+
+        var mediaMessageOne = Data(repeating: 0, count: 36)
+        mediaMessageOne[1] = 1 // version 1
+        mediaMessageOne[3] = 1 // message 1
+        mediaMessageOne[8] = UInt8(fixture.port >> 8)
+        mediaMessageOne[9] = UInt8(fixture.port & 0xff)
+        mediaMessageOne[14] = UInt8(fixture.port >> 8)
+        mediaMessageOne[15] = UInt8(fixture.port & 0xff)
+        var framedMediaMessage = Data([0, UInt8(mediaMessageOne.count)])
+        framedMediaMessage.append(mediaMessageOne)
+        try fixture.sendServerBytes(Self.framebufferUpdate([(
+            Self.rectangleHeader(
+                x: 0, y: 0, width: 0, height: 0,
+                encoding: Encoding.appleH264.rawValue),
+            framedMediaMessage,
+        )]))
+
+        let observedOffers = await Self.withTimeout(seconds: 2) {
+            for await event in session.events {
+                if case .mediaStreamOffer(let offer) = event {
+                    return [offer]
+                }
+            }
+            return []
+        }
+        XCTAssertEqual(observedOffers?.first?.messageType, 1)
+        XCTAssertEqual(observedOffers?.first?.videoStream1UDPPort, fixture.port)
+
+        // The compound media configuration (type 28) goes out as a plain RFB
+        // message, not inside a u16-length AES record.
+        let afterMessageOneBytes = await fixture.waitForClientBytes(atLeast: beforeMessageOne + 1)
+        let afterMessageOne = try XCTUnwrap(afterMessageOneBytes)
+        XCTAssertEqual(afterMessageOne[beforeMessageOne], 0x1c)
+
+        await session.disconnect()
+    }
+
     func testPasswordOnlyHighPerformanceRequestsConsoleWhenDirectConnectIsUnavailable() async throws {
         let encodings: [Encoding] = [
             .appleH264, .mediaStreamOffer, .serverDisplayInfo, .raw,
@@ -588,6 +676,60 @@ final class TransportSessionScriptedTests: XCTestCase {
                 .elementsEqual(incrementalRequest)
         }
         XCTAssertTrue(sentPositiveRequest)
+        await session.disconnect()
+    }
+
+    /// An Apple-protocol server without DCT (wayshare) answers the initial
+    /// request with portable rectangles; later requests must be incremental.
+    func testAppleServerWithoutDCTFallsBackToIncrementalRequests() async throws {
+        let connection = ScriptedRFBConnection()
+        let width: UInt16 = 2
+        let height: UInt16 = 2
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: width, height: height, name: "apple-no-dct"))
+        script.append(Self.framebufferUpdate([
+            (Self.rectangleHeader(
+                x: 0, y: 0, width: width, height: 1,
+                encoding: Encoding.raw.rawValue), Data(count: 8)),
+            (Self.rectangleHeader(
+                x: 0, y: 1, width: width, height: 1,
+                encoding: Encoding.raw.rawValue), Data(count: 8)),
+        ]))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "apple-no-dct.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: Self.appleDCTEncodings,
+            displayCount: 1,
+            connection: connection)
+        let updateTask = Task {
+            for await event in session.events {
+                guard case .framebufferUpdate = event else { continue }
+                try? await session.finishFramebufferUpdate()
+                return true
+            }
+            return false
+        }
+        try await session.connect()
+        let receivedUpdate = await updateTask.value
+        XCTAssertTrue(receivedUpdate)
+
+        let fullRequest = ClientMessage.framebufferUpdateRequest(
+            incremental: false, x: 0, y: 0, width: width, height: height).serialize()
+        let incrementalRequest = ClientMessage.framebufferUpdateRequest(
+            incremental: true, x: 0, y: 0, width: width, height: height).serialize()
+        let sentIncremental = await Self.waitUntil {
+            let sent = await connection.sentBytes()
+            return Self.occurrenceCount(of: incrementalRequest, in: sent) == 1
+        }
+        XCTAssertTrue(sentIncremental)
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 1)
         await session.disconnect()
     }
 

@@ -75,7 +75,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RFBTransportTests",
-            dependencies: ["RFBTransport", "RFBProtocol"],
+            dependencies: ["RFBTransport", "RFBProtocol", .product(name: "BigInt", package: "BigInt")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(

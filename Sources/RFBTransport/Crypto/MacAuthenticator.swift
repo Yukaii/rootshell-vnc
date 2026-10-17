@@ -35,13 +35,6 @@ public struct MacAuthenticator: Authenticator, Sendable {
     private static let capabilitiesString =
         "mda=SHA-512,replay_detection,conf+int=ChaCha20-Poly1305,kdf=SALTED-SHA512-PBKDF2"
 
-    private struct SRPClientResponse: Sendable {
-        let publicKey: Data
-        let proof: Data
-        let expectedServerProof: Data
-        let sessionKey: Data
-    }
-
     public init(username: String, password: String) {
         self.username = username
         self.password = password
@@ -162,7 +155,7 @@ public struct MacAuthenticator: Authenticator, Sendable {
         log.info(
             "Type 33 SRP authenticated; serverIV=\(confirmation.serverIV.count) bytes, "
                 + "maxBufferSize=\(confirmation.maxBufferSize)")
-        return AuthenticationResult(appleSessionKey: appleSRPAESKey(from: client.sessionKey))
+        return AuthenticationResult(appleSessionKey: AppleSRPClient.rfbSessionKey(from: client.sessionKey))
     }
 
     // MARK: - Phase 1: RSA Key Exchange
@@ -566,46 +559,16 @@ public struct MacAuthenticator: Authenticator, Sendable {
         iterations: UInt32,
         keyLength: Int
     ) throws -> Data {
-        var derivedKey = Data(count: keyLength)
-
-        let result = derivedKey.withUnsafeMutableBytes { derivedPtr in
-            salt.withUnsafeBytes { saltPtr in
-                key.withUnsafeBytes { keyPtr in
-                    CCKeyDerivationPBKDF(
-                        CCPBKDFAlgorithm(kCCPBKDF2),
-                        keyPtr.baseAddress?.assumingMemoryBound(to: Int8.self),
-                        key.count,
-                        saltPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                        salt.count,
-                        CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA512),
-                        iterations,
-                        derivedPtr.baseAddress?.assumingMemoryBound(to: UInt8.self),
-                        keyLength
-                    )
-                }
-            }
-        }
-
-        guard result == kCCSuccess else {
-            throw VNCProtocolError.ioError("PBKDF2-SHA512 failed with status \(result)")
-        }
-
-        return derivedKey
+        try AppleSRPClient.pbkdf2HMACSHA512(
+            key: key, salt: salt, iterations: iterations, keyLength: keyLength)
     }
 
-    private func computeSRPResponse(challenge: AppleSRPServerChallenge) throws -> SRPClientResponse {
-        let primeLength = challenge.prime.count
+    private func computeSRPResponse(challenge: AppleSRPServerChallenge) throws -> AppleSRPClient.Response {
         let N = BigUInt(challenge.prime)
         let g = BigUInt(challenge.generator)
         let B = BigUInt(challenge.serverPublicKey)
 
-        guard N > 0, g > 1, g < N, B % N != 0 else {
-            throw VNCProtocolError.authenticationFailed("Mac Auth SRP: invalid server public key")
-        }
-        guard challenge.iterations <= UInt64(UInt32.max) else {
-            throw VNCProtocolError.authenticationFailed(
-                "Mac Auth SRP: unsupported PBKDF2 iteration count \(challenge.iterations)")
-        }
+        try AppleSRPClient.validate(challenge)
 
         let iterations = UInt32(challenge.iterations)
         let xCandidates = try srpXCandidates(salt: challenge.salt, iterations: iterations)
@@ -619,7 +582,6 @@ public struct MacAuthenticator: Authenticator, Sendable {
         guard let selected else {
             throw VNCProtocolError.authenticationFailed("Mac Auth SRP: no KDF variant selected")
         }
-        let x = selected.value
         log.debug("Mac Auth SRP selected KDF variant: \(selected.name)")
 
         if ProcessInfo.processInfo.environment["ROOTSHELL_VNC_TYPE33_SRP_VERIFY_B_AS_VERIFIER"] == "1" {
@@ -631,37 +593,6 @@ public struct MacAuthenticator: Authenticator, Sendable {
             }
         }
 
-        let privateKey = BigUInt(try randomBytes(count: 64))
-        let A = g.power(privateKey, modulus: N)
-        guard A % N != 0 else {
-            throw VNCProtocolError.authenticationFailed("Mac Auth SRP: computed A is zero")
-        }
-
-        let paddedN = pad(A: N.serialize(), length: primeLength)
-        let paddedG = pad(A: g.serialize(), length: primeLength)
-        let paddedA = pad(A: A.serialize(), length: primeLength)
-        let paddedB = pad(A: B.serialize(), length: primeLength)
-
-        let k = BigUInt(sha512(paddedN + paddedG))
-        let u = BigUInt(sha512(paddedA + paddedB))
-        guard u != 0 else {
-            throw VNCProtocolError.authenticationFailed("Mac Auth SRP: computed u is zero")
-        }
-
-        let gx = g.power(x, modulus: N)
-        let base = (B + N - ((k * gx) % N)) % N
-        let exponent = privateKey + (u * x)
-        let S = base.power(exponent, modulus: N)
-        let paddedS = pad(A: S.serialize(), length: primeLength)
-        let K = sha512(paddedS)
-
-        let hashN = sha512(paddedN)
-        let hashG = sha512(paddedG)
-        var xor = Data(count: hashN.count)
-        for i in 0..<hashN.count {
-            xor[i] = hashN[i] ^ hashG[i]
-        }
-
         let proofUsername: Data
         if ProcessInfo.processInfo.environment["ROOTSHELL_VNC_TYPE33_SRP_PROOF_USERNAME"] == "1" {
             proofUsername = Data(username.utf8)
@@ -669,15 +600,11 @@ public struct MacAuthenticator: Authenticator, Sendable {
             // This mechanism defines the SRP proof with an empty username.
             proofUsername = Data()
         }
-        let userHash = sha512(proofUsername)
-        let proof = sha512(xor + userHash + challenge.salt + paddedA + paddedB + K)
-        let serverProof = sha512(paddedA + proof + K)
-        return SRPClientResponse(
-            publicKey: paddedA,
-            proof: proof,
-            expectedServerProof: serverProof,
-            sessionKey: K
-        )
+        return try AppleSRPClient.respond(
+            challenge: challenge,
+            x: selected.value,
+            privateKey: AppleSRPClient.randomPrivateKey(),
+            proofUsername: proofUsername)
     }
 
     private func srpXCandidates(
@@ -737,28 +664,8 @@ public struct MacAuthenticator: Authenticator, Sendable {
         Data(SHA512.hash(data: data))
     }
 
-    private func appleSRPAESKey(from sessionKey: Data) -> Data {
-        Data(SHA256.hash(data: sessionKey).prefix(kCCKeySizeAES128))
-    }
-
     private func randomBytes(count: Int) throws -> Data {
-        var data = Data(count: count)
-        let result = data.withUnsafeMutableBytes { ptr in
-            SecRandomCopyBytes(kSecRandomDefault, count, ptr.baseAddress!)
-        }
-        guard result == errSecSuccess else {
-            throw VNCProtocolError.ioError("Failed to generate \(count) random bytes")
-        }
-        return data
-    }
-
-    private func pad(A data: Data, length: Int) -> Data {
-        if data.count >= length {
-            return Data(data.suffix(length))
-        }
-        var padded = Data(count: length - data.count)
-        padded.append(data)
-        return padded
+        try AppleSRPClient.randomBytes(count: count)
     }
 
     // MARK: - Wire helpers

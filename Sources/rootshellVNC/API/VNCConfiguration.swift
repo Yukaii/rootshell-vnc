@@ -275,6 +275,31 @@ public struct VNCConfiguration: Sendable {
     /// session advertises, so it takes effect only on a new connection.
     public var cursorRendering: VNCCursorRendering
 
+    /// The operating system behind the server, which decides how Option is sent.
+    public var remoteSystem: RemoteSystem
+
+    public enum RemoteSystem: String, Sendable, Equatable, CaseIterable {
+        /// A Mac for Apple-protocol servers, unless the handshake identifies another system.
+        case automatic
+        case mac
+        case other
+
+        /// Whether Option goes out as Meta, which macOS reads as Option. wayshare
+        /// on Linux reads Meta as Super.
+        func usesAppleModifiers(
+            isAppleProtocol: Bool,
+            offeredSecurityTypes: [SecurityType]
+        ) -> Bool {
+            switch self {
+            case .mac: true
+            case .other: false
+            case .automatic:
+                isAppleProtocol
+                    && !SecurityType.offersAppleSRPWithoutMacTypes(offeredSecurityTypes)
+            }
+        }
+    }
+
     /// The pseudo-encodings that ask a server to deliver the pointer as a
     /// separate shape rather than drawn into the framebuffer. Advertising any
     /// one of them is what makes the server withhold the pointer, so
@@ -351,6 +376,7 @@ public struct VNCConfiguration: Sendable {
         enableRemoteAudio: Bool = true,
         promptForLoginPasswordAtLoginWindow: Bool = false,
         cursorRendering: VNCCursorRendering = .client,
+        remoteSystem: RemoteSystem = .automatic,
         targetFrameRate: Int = 60,
         enableProtocolTrace: Bool = false,
         reconnectionPolicy: VNCReconnectionPolicy = VNCReconnectionPolicy(),
@@ -393,6 +419,7 @@ public struct VNCConfiguration: Sendable {
         self.promptForLoginPasswordAtLoginWindow =
             promptForLoginPasswordAtLoginWindow
         self.cursorRendering = cursorRendering
+        self.remoteSystem = remoteSystem
         self.targetFrameRate = max(1, min(120, targetFrameRate))
         self.enableProtocolTrace = enableProtocolTrace
         self.reconnectionPolicy = reconnectionPolicy

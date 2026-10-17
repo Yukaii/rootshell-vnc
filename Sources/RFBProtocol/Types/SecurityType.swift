@@ -9,7 +9,7 @@ public enum SecurityType: Sendable, Equatable, Hashable {
     case apple30
     case macAuthentication
     case srp
-    case kerberos
+    case appleSRP
     case unknown(UInt8)
 
     // MARK: - Raw value mapping
@@ -24,7 +24,7 @@ public enum SecurityType: Sendable, Equatable, Hashable {
         case .apple30:             return 30
         case .macAuthentication:   return 33
         case .srp:                 return 35
-        case .kerberos:            return 36
+        case .appleSRP:            return 36
         case .unknown(let v):      return v
         }
     }
@@ -39,7 +39,7 @@ public enum SecurityType: Sendable, Equatable, Hashable {
         case 30: self = .apple30
         case 33: self = .macAuthentication
         case 35: self = .srp
-        case 36: self = .kerberos
+        case 36: self = .appleSRP
         default: self = .unknown(rawValue)
         }
     }
@@ -53,12 +53,12 @@ public enum SecurityType: Sendable, Equatable, Hashable {
         case .none:                return 0
         case .vncAuthentication:   return 1
         case .apple30:             return 2
+        case .appleSRP:            return 2
         case .macAuthentication:   return 3
         case .vencrypt:            return 4
         // Not yet implemented:
         case .srp:                 return nil
         case .tight:               return nil
-        case .kerberos:            return nil
         case .unknown:             return nil
         }
     }
@@ -77,4 +77,15 @@ public enum VNCSecurityPolicy: String, Sendable, Equatable, Hashable, CaseIterab
     case vncAuthentication
     case apple30
     case macAuthentication
+    case appleSRP
+}
+
+extension SecurityType {
+    /// An Apple-protocol server offering SRP without the 30/33 types every
+    /// Mac offers: Screen Sharing servers on other systems, such as wayshare.
+    public static func offersAppleSRPWithoutMacTypes(_ offered: [SecurityType]) -> Bool {
+        offered.contains(.appleSRP)
+            && !offered.contains(.apple30)
+            && !offered.contains(.macAuthentication)
+    }
 }

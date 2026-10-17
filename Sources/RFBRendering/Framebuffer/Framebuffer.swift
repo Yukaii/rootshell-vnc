@@ -49,8 +49,9 @@ public final class Framebuffer: @unchecked Sendable {
                 | CGBitmapInfo.byteOrder16Little.rawValue
             self.bitsPerComponent = 5
         } else {
-            // BGRA format native to macOS/iOS
-            self.bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
+            // BGRX: the fourth byte is depth-24 padding, which Raw/Zlib servers
+            // such as wayshare send as zero; treating it as alpha draws black.
+            self.bitmapInfo = CGImageAlphaInfo.noneSkipFirst.rawValue
                 | CGBitmapInfo.byteOrder32Little.rawValue
             self.bitsPerComponent = 8
         }

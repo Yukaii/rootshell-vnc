@@ -235,7 +235,7 @@ final class SecurityTypeTests: XCTestCase {
         XCTAssertEqual(SecurityType.apple30.rawValue, 30)
         XCTAssertEqual(SecurityType.macAuthentication.rawValue, 33)
         XCTAssertEqual(SecurityType.srp.rawValue, 35)
-        XCTAssertEqual(SecurityType.kerberos.rawValue, 36)
+        XCTAssertEqual(SecurityType.appleSRP.rawValue, 36)
     }
 
     func testInitFromRawValue() {
@@ -246,7 +246,7 @@ final class SecurityTypeTests: XCTestCase {
         XCTAssertEqual(SecurityType(rawValue: 30), .apple30)
         XCTAssertEqual(SecurityType(rawValue: 33), .macAuthentication)
         XCTAssertEqual(SecurityType(rawValue: 35), .srp)
-        XCTAssertEqual(SecurityType(rawValue: 36), .kerberos)
+        XCTAssertEqual(SecurityType(rawValue: 36), .appleSRP)
     }
 
     func testUnknownRawValue() {
@@ -258,7 +258,7 @@ final class SecurityTypeTests: XCTestCase {
     func testRoundTripThroughRawValue() {
         let allKnown: [SecurityType] = [
             .none, .vncAuthentication, .tight, .vencrypt, .apple30,
-            .macAuthentication, .srp, .kerberos,
+            .macAuthentication, .srp, .appleSRP,
         ]
         for type in allKnown {
             let recreated = SecurityType(rawValue: type.rawValue)
@@ -275,7 +275,7 @@ final class SecurityTypeTests: XCTestCase {
         // SRP not yet implemented (client-speaks-first protocol)
         XCTAssertNil(SecurityType.srp.negotiationPriority)
         XCTAssertNil(SecurityType.tight.negotiationPriority)
-        XCTAssertNil(SecurityType.kerberos.negotiationPriority)
+        XCTAssertEqual(SecurityType.appleSRP.negotiationPriority, 2)
         XCTAssertNil(SecurityType.unknown(99).negotiationPriority)
     }
 
@@ -289,6 +289,13 @@ final class SecurityTypeTests: XCTestCase {
         let macPriority = SecurityType.macAuthentication.negotiationPriority!
         let dhPriority = SecurityType.apple30.negotiationPriority!
         XCTAssertGreaterThan(macPriority, dhPriority)
+    }
+
+    func testAppleSRPWithoutMacTypesSignature() {
+        XCTAssertTrue(SecurityType.offersAppleSRPWithoutMacTypes([.appleSRP]))
+        XCTAssertTrue(SecurityType.offersAppleSRPWithoutMacTypes([.none, .appleSRP]))
+        XCTAssertFalse(SecurityType.offersAppleSRPWithoutMacTypes([.apple30, .macAuthentication, .appleSRP]))
+        XCTAssertFalse(SecurityType.offersAppleSRPWithoutMacTypes([.vncAuthentication]))
     }
 
     func testVeNCryptHasHighestSupportedNegotiationPriority() {
@@ -1507,6 +1514,40 @@ final class ConnectionStateMachineTests: XCTestCase {
         guard case .sendSecurityType(.vncAuthentication) = actions.first else {
             return XCTFail("Expected portable VNC authentication")
         }
+    }
+
+    func testAutomaticSecurityKeepsMacAuthenticationWhenAppleSRPIsAlsoOffered() {
+        var sm = ConnectionStateMachine(hasUsername: true)
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.apple))
+
+        _ = sm.handle(event: .receivedSecurityTypes([.apple30, .macAuthentication, .appleSRP]))
+        XCTAssertEqual(sm.selectedSecurityType, .macAuthentication)
+    }
+
+    func testAutomaticSecuritySelectsAppleSRPWhenItIsTheOnlyAppleType() {
+        var sm = ConnectionStateMachine(hasUsername: true)
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.apple))
+
+        let actions = sm.handle(event: .receivedSecurityTypes([.appleSRP]))
+        XCTAssertEqual(sm.selectedSecurityType, .appleSRP)
+        guard case .sendSecurityType(.appleSRP) = actions.first else {
+            return XCTFail("Expected Apple SRP")
+        }
+    }
+
+    func testAppleSRPOnlyServerWithoutUsernameAsksForOne() {
+        var sm = ConnectionStateMachine()
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.apple))
+
+        let actions = sm.handle(event: .receivedSecurityTypes([.appleSRP]))
+        XCTAssertNil(sm.selectedSecurityType)
+        guard case .reportError(.authenticationFailed(let reason)) = actions.first else {
+            return XCTFail("Expected an authentication error")
+        }
+        XCTAssertEqual(reason, "This server requires a user name and password")
     }
 
     func testRequireEncryptionSelectsVeNCrypt() {

@@ -120,7 +120,9 @@ public struct ConnectionStateMachine: Sendable {
 
             guard let selected = selectBestSecurityType(from: types) else {
                 let error = VNCProtocolError.authenticationFailed(
-                    "The server does not offer the requested security method")
+                    requiresUsername(types)
+                        ? "This server requires a user name and password"
+                        : "The server does not offer the requested security method")
                 state = .failed(error)
                 return [.reportError(error)]
             }
@@ -280,6 +282,7 @@ public struct ConnectionStateMachine: Sendable {
                 case "vnc", "vncAuthentication".lowercased(): return .vncAuthentication
                 case "apple30", "dh": return .apple30
                 case "mac", "macAuthentication".lowercased(), "type33": return .macAuthentication
+                case "applesrp", "type36": return .appleSRP
                 default:
                     if let raw = UInt8(forced) {
                         return SecurityType(rawValue: raw)
@@ -301,6 +304,8 @@ public struct ConnectionStateMachine: Sendable {
             return types.contains(.apple30) ? .apple30 : nil
         case .macAuthentication:
             return types.contains(.macAuthentication) ? .macAuthentication : nil
+        case .appleSRP:
+            return types.contains(.appleSRP) ? .appleSRP : nil
         case .requireEncryption:
             // Handled before diagnostic overrides above.
             return types.contains(.vencrypt) ? .vencrypt : nil
@@ -308,6 +313,7 @@ public struct ConnectionStateMachine: Sendable {
             if negotiatedVersion?.isApple == true, hasUsername {
                 if types.contains(.macAuthentication) { return .macAuthentication }
                 if types.contains(.apple30) { return .apple30 }
+                if types.contains(.appleSRP) { return .appleSRP }
             }
             // TigerVNC commonly offers anonymous TLSVnc alongside VncAuth.
             // NIOSSL cannot negotiate anonymous cipher suites, so take the
@@ -318,6 +324,14 @@ public struct ConnectionStateMachine: Sendable {
             if types.contains(.none) { return SecurityType.none }
             return nil
         }
+    }
+
+    /// Automatic selection skipped Apple types only because no username was set.
+    private func requiresUsername(_ types: [SecurityType]) -> Bool {
+        securityPolicy == .automatic
+            && negotiatedVersion?.isApple == true
+            && !hasUsername
+            && types.contains { [.apple30, .macAuthentication, .appleSRP].contains($0) }
     }
 
     /// RFB 3.3 does not let the client choose a type, but a server-selected
@@ -335,9 +349,11 @@ public struct ConnectionStateMachine: Sendable {
             return type == .apple30
         case .macAuthentication:
             return type == .macAuthentication
+        case .appleSRP:
+            return type == .appleSRP
         case .automatic:
             switch type {
-            case .none, .vncAuthentication, .vencrypt, .apple30, .macAuthentication:
+            case .none, .vncAuthentication, .vencrypt, .apple30, .macAuthentication, .appleSRP:
                 return true
             default:
                 return false
