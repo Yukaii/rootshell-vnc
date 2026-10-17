@@ -23,16 +23,24 @@ private actor MediaRecoveryCoordinator {
 }
 
 /// Union the selected leading displays and translate the result into the
-/// framebuffer's normalized coordinate space.
+/// framebuffer's normalized coordinate space. A framebuffer that has been
+/// resized to the selection alone, as after a Standard SetDisplay, already
+/// holds it at the origin.
 func normalizedSelectedDisplayRegion(
     _ regions: [CGRect],
-    displayCount: Int
+    displayCount: Int,
+    framebufferSize: CGSize? = nil
 ) -> CGRect? {
     guard let first = regions.first else { return nil }
     let all = regions.dropFirst().reduce(first) { $0.union($1) }
     let count = min(max(1, displayCount), regions.count)
     let selected = regions.prefix(count).dropFirst().reduce(first) {
         $0.union($1)
+    }
+    if let framebufferSize,
+       framebufferSize == selected.size,
+       framebufferSize != all.size {
+        return CGRect(origin: .zero, size: selected.size)
     }
     return selected.offsetBy(dx: -all.minX, dy: -all.minY)
 }
@@ -331,10 +339,15 @@ struct StandardInitialFramePresentationTracker {
         trackedSize = .zero
     }
 
+    /// `displayRegions` is the server's announced display layout. When the
+    /// framebuffer is that layout's bounding box, only the displays need
+    /// coverage: the gaps between them are never encoded, and a display such
+    /// as a Sidecar iPad may arrive only after the first one is presented.
     mutating func ingest(
         _ rects: [(FramebufferRect, Data)],
         framebufferWidth: Int,
-        framebufferHeight: Int
+        framebufferHeight: Int,
+        displayRegions: [CGRect] = []
     ) -> Bool {
         guard !completedInitialFrame else { return true }
 
@@ -392,10 +405,38 @@ struct StandardInitialFramePresentationTracker {
             }
         }
 
-        if uncoveredRegions.isEmpty {
+        if uncoveredRegions.isEmpty
+            || coversAnnouncedDisplays(displayRegions) {
             completedInitialFrame = true
         }
         return completedInitialFrame
+    }
+
+    /// True when at least one announced display is fully covered and no
+    /// display is only partly covered. A partly covered display is a regional
+    /// bootstrap still in flight; an untouched one fills in progressively.
+    private func coversAnnouncedDisplays(_ displayRegions: [CGRect]) -> Bool {
+        guard let first = displayRegions.first else { return false }
+        let layout = displayRegions.dropFirst().reduce(first) { $0.union($1) }
+        // Only a framebuffer holding the whole layout shares its coordinates;
+        // a single selected display has been resized to that display alone.
+        guard layout.size == trackedSize else { return false }
+
+        var coveredDisplay = false
+        for region in displayRegions {
+            let display = region.offsetBy(dx: -layout.minX, dy: -layout.minY)
+            let uncoveredArea = uncoveredRegions.reduce(CGFloat(0)) {
+                let overlap = $1.intersection(display)
+                guard !overlap.isNull else { return $0 }
+                return $0 + overlap.width * overlap.height
+            }
+            if uncoveredArea == 0 {
+                coveredDisplay = true
+            } else if uncoveredArea < display.width * display.height {
+                return false
+            }
+        }
+        return coveredDisplay
     }
 
     private static func subtract(
@@ -2229,7 +2270,10 @@ public final class VNCSession {
         }
         return normalizedSelectedDisplayRegion(
             remoteDisplayRegions,
-            displayCount: configuration.displayCount)
+            displayCount: configuration.displayCount,
+            framebufferSize: CGSize(
+                width: framebufferWidth,
+                height: framebufferHeight))
     }
 
     var presentedFramebufferSize: CGSize {
@@ -2350,7 +2394,8 @@ public final class VNCSession {
             .ingest(
                 renderRects,
                 framebufferWidth: framebufferWidth,
-                framebufferHeight: framebufferHeight)
+                framebufferHeight: framebufferHeight,
+                displayRegions: remoteDisplayRegions)
         let displaySuspended = suspendsDisplayPresentation
             || VNCPresentationPolicy.isPresentationProhibited()
         let takeSnapshot = publishDue
