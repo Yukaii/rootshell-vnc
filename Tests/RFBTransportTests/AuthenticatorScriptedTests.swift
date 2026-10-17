@@ -67,6 +67,7 @@ final class AuthenticatorScriptedTests: XCTestCase {
                 UInt8(subtype & 0xff),
             ])
         }
+        serverBytes.append(1) // Subtype accepted.
         await connection.enqueueServerBytes(serverBytes)
 
         let authenticator = VeNCryptAuthenticator(
@@ -75,6 +76,11 @@ final class AuthenticatorScriptedTests: XCTestCase {
             username: "alice",
             password: "secret")
         _ = try await authenticator.authenticate(connection: connection)
+
+        // The acceptance byte precedes the TLS handshake on the wire, so it
+        // must be consumed before the TLS handler is installed.
+        let readBeforeTLS = await connection.bytesReadBeforeTLSUpgrade()
+        XCTAssertEqual(readBeforeTLS, serverBytes.count)
 
         var expected = Data([0, 2, 0, 0, 1, 6]) // version + X509Plain(262)
         expected.append(contentsOf: [0, 0, 0, 5, 0, 0, 0, 6])
@@ -117,5 +123,33 @@ final class AuthenticatorScriptedTests: XCTestCase {
         }
         let endpoint = await connection.upgradedTLSEndpoint()
         XCTAssertNil(endpoint)
+    }
+
+    func testVeNCryptSubtypeRejectionFailsBeforeTLS() async throws {
+        let connection = ScriptedRFBConnection()
+        var serverBytes = Data([0, 2, 0, 1])
+        serverBytes.append(contentsOf: [0, 0, 0x01, 0x06]) // X509Plain(262)
+        serverBytes.append(0) // Subtype rejected.
+        await connection.enqueueServerBytes(serverBytes)
+
+        do {
+            _ = try await VeNCryptAuthenticator(
+                host: "linux.example",
+                port: 5900,
+                username: "alice",
+                password: "secret"
+            ).authenticate(connection: connection)
+            XCTFail("Expected a rejected VeNCrypt subtype to fail")
+        } catch let error as VNCProtocolError {
+            guard case .authenticationFailed = error else {
+                XCTFail("Expected authenticationFailed, got \(error)")
+                return
+            }
+        }
+        let endpoint = await connection.upgradedTLSEndpoint()
+        XCTAssertNil(endpoint)
+        // No credentials may leave the client after a rejection.
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(sent, Data([0, 2, 0, 0, 1, 6]))
     }
 }

@@ -21,6 +21,8 @@ actor ScriptedRFBConnection: RFBConnection {
     private var readWaiters: [CheckedContinuation<Void, Never>] = []
     private var onSend: (@Sendable (Data) -> Data?)?
     private var tlsUpgradeEndpoint: (String, UInt16)?
+    private var totalBytesRead = 0
+    private var tlsUpgradeReadCount: Int?
 
     // MARK: - Test scripting
 
@@ -50,6 +52,11 @@ actor ScriptedRFBConnection: RFBConnection {
 
     func upgradedTLSEndpoint() -> (String, UInt16)? {
         tlsUpgradeEndpoint
+    }
+
+    /// How many server bytes the client had consumed when it started TLS.
+    func bytesReadBeforeTLSUpgrade() -> Int? {
+        tlsUpgradeReadCount
     }
 
     /// Simulate an out-of-band transport failure reported through the
@@ -109,6 +116,7 @@ actor ScriptedRFBConnection: RFBConnection {
         tlsUpgradeEndpoint = (
             configuration.serverHostname,
             configuration.serverPort)
+        tlsUpgradeReadCount = totalBytesRead
     }
 
     // MARK: - Internals
@@ -131,6 +139,7 @@ actor ScriptedRFBConnection: RFBConnection {
         let start = serverBytes.startIndex + readOffset
         let result = serverBytes.subdata(in: start..<(start + count))
         readOffset += count
+        totalBytesRead += count
         if readOffset == serverBytes.count {
             serverBytes.removeAll(keepingCapacity: true)
             readOffset = 0

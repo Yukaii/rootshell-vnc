@@ -510,6 +510,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         // VeNCrypt 0.2 accepted, with X509None as the sole subtype.
         script.append(contentsOf: [0, 2, 0, 1])
         script.append(Self.uint32Bytes(260))
+        script.append(1) // Subtype accepted.
         script.append(contentsOf: [0, 0, 0, 0]) // RFB SecurityResult OK
         script.append(Self.serverInitMessage(
             width: 1024, height: 768, name: "rfb37-vencrypt"))

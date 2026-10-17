@@ -76,6 +76,14 @@ public struct VeNCryptAuthenticator: Authenticator, Sendable {
 
         try await connection.send(Self.bigEndianData(selected.rawValue))
         log.info("Selected VeNCrypt subtype \(selected.rawValue)")
+        // VeNCrypt 0.2 acknowledges the selection with one byte (1 = accepted)
+        // before the TLS handshake; it must be consumed so the handshake
+        // starts at the server's ServerHello.
+        let subtypeStatus = try await connection.read(exactly: 1)
+        guard subtypeStatus.first == 1 else {
+            throw VNCProtocolError.authenticationFailed(
+                "The server rejected VeNCrypt subtype \(selected.rawValue)")
+        }
         try await connection.startTLS(configuration: RFBTLSConfiguration(
             serverHostname: host,
             serverPort: port,
